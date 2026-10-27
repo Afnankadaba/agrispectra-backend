@@ -3,6 +3,9 @@ from flask_cors import CORS
 from dotenv import load_dotenv
 
 import os
+import base64
+import struct
+import zlib
 import requests
 import numpy as np
 import tifffile
@@ -1265,6 +1268,149 @@ def decode_ndvi_tiff(content):
 
 
     return valid_ndvi
+
+
+
+# ============================================================
+# NDVI HEATMAP API
+# Returns a transparent PNG encoded as base64 plus geographic bounds.
+# ============================================================
+
+def decode_ndvi_grid(content):
+    image = np.asarray(tifffile.imread(BytesIO(content)), dtype=np.float32)
+
+    if image.ndim == 3 and image.shape[0] == 2:
+        ndvi_array, mask_array = image[0], image[1]
+    elif image.ndim == 3 and image.shape[-1] == 2:
+        ndvi_array, mask_array = image[:, :, 0], image[:, :, 1]
+    else:
+        raise ValueError(f"Unexpected TIFF structure: {image.shape}")
+
+    valid = (
+        (mask_array > 0)
+        & (ndvi_array >= -1.0)
+        & (ndvi_array <= 1.0)
+        & np.isfinite(ndvi_array)
+    )
+    return ndvi_array, valid
+
+
+def _png_chunk(chunk_type, data):
+    chunk = chunk_type + data
+    return (
+        struct.pack(">I", len(data))
+        + chunk
+        + struct.pack(">I", zlib.crc32(chunk) & 0xffffffff)
+    )
+
+
+def ndvi_grid_to_png(ndvi_array, valid_mask):
+    """Create a transparent RGBA PNG: red low, yellow moderate, green high."""
+    height, width = ndvi_array.shape
+    raw = bytearray()
+
+    # PNG rows run from north to south. The TIFF grid is kept in its source order.
+    for y in range(height):
+        raw.append(0)  # PNG filter: None
+        for x in range(width):
+            if not valid_mask[y, x]:
+                raw.extend((0, 0, 0, 0))
+                continue
+
+            value = float(ndvi_array[y, x])
+            if value < 0.20:
+                rgba = (220, 55, 55, 205)       # low vegetation
+            elif value < 0.50:
+                rgba = (255, 205, 45, 205)      # moderate vegetation
+            else:
+                rgba = (35, 160, 75, 205)       # higher vegetation
+            raw.extend(rgba)
+
+    png = (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
+        + _png_chunk(b"IDAT", zlib.compress(bytes(raw)))
+        + _png_chunk(b"IEND", b"")
+    )
+    return png
+
+
+@app.route("/sentinel-ndvi-heatmap", methods=["GET"])
+def sentinel_ndvi_heatmap():
+    try:
+        latitude = float(request.args.get("latitude", ""))
+        longitude = float(request.args.get("longitude", ""))
+
+        if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
+            return jsonify({"success": False, "error": "Invalid coordinates."}), 400
+
+        # Match the current /sentinel-ndvi bounding box (about 1 km across).
+        delta = 0.005
+        bbox = [longitude - delta, latitude - delta, longitude + delta, latitude + delta]
+        token = get_copernicus_token()
+        today = datetime.now(timezone.utc)
+        attempts = []
+
+        for strategy in [
+            {"days": 60, "cloud": 30},
+            {"days": 120, "cloud": 60},
+            {"days": 180, "cloud": 80},
+            {"days": 365, "cloud": 90},
+        ]:
+            from_date = (today - timedelta(days=strategy["days"])).strftime("%Y-%m-%dT00:00:00Z")
+            to_date = today.strftime("%Y-%m-%dT23:59:59Z")
+            try:
+                content = request_sentinel_image(
+                    token, bbox, from_date, to_date, strategy["cloud"]
+                )
+                ndvi_grid, valid_mask = decode_ndvi_grid(content)
+                valid_count = int(np.count_nonzero(valid_mask))
+                attempts.append({
+                    "days": strategy["days"],
+                    "cloud_limit": strategy["cloud"],
+                    "valid_pixels": valid_count,
+                })
+                if valid_count:
+                    png = ndvi_grid_to_png(ndvi_grid, valid_mask)
+                    return jsonify({
+                        "success": True,
+                        "image_base64": base64.b64encode(png).decode("ascii"),
+                        "bounds": {
+                            "south": latitude - delta,
+                            "west": longitude - delta,
+                            "north": latitude + delta,
+                            "east": longitude + delta,
+                        },
+                        "valid_pixels": valid_count,
+                        "date_from": from_date,
+                        "date_to": to_date,
+                        "cloud_coverage_limit": strategy["cloud"],
+                        "legend": {
+                            "red": "NDVI below 0.20 — low vegetation",
+                            "yellow": "NDVI 0.20–0.49 — moderate vegetation",
+                            "green": "NDVI 0.50 or higher — higher vegetation",
+                        },
+                        "attempts": attempts,
+                    })
+
+            except Exception as exc:
+                attempts.append({
+                    "days": strategy["days"],
+                    "cloud_limit": strategy["cloud"],
+                    "error": str(exc)[:500],
+                })
+
+        return jsonify({
+            "success": False,
+            "error": "No valid Sentinel-2 pixels were found for the heatmap.",
+            "attempts": attempts,
+        }), 404
+
+    except ValueError:
+        return jsonify({"success": False, "error": "Valid latitude and longitude are required."}), 400
+    except Exception as exc:
+        app.logger.exception("NDVI heatmap generation failed")
+        return jsonify({"success": False, "error": str(exc)[:500]}), 500
 
 
 # ============================================================
