@@ -2015,6 +2015,42 @@ def sentinel_ndvi():
 
 
         # ====================================================
+        # VEGETATION SUITABILITY SCREEN (NOT A BUILDING CLASSIFIER)
+        # ====================================================
+        # NDVI alone cannot reliably distinguish buildings from bare soil,
+        # dry fields, or other non-vegetated surfaces. This conservative
+        # screen prevents a crop-health score when almost no pixels show
+        # meaningful vegetation, but labels the result as a *possible*
+        # built-up/non-vegetated area rather than claiming certainty.
+        vegetation_fraction = float(
+            np.count_nonzero(successful_ndvi >= 0.25)
+            / successful_ndvi.size
+        ) if successful_ndvi.size else 0.0
+        mean_for_screen = float(np.mean(successful_ndvi))
+
+        if mean_for_screen < 0.15 and vegetation_fraction < 0.08:
+            return jsonify({
+                "success": False,
+                "area_type": "possible_built_up_or_non_vegetated",
+                "message": (
+                    "Sorry, this selected area appears to have very little "
+                    "vegetation and may be a built-up or non-vegetated area. "
+                    "Crop-health analysis is unavailable for this selection. "
+                    "This is an NDVI-based screening result, not a definitive "
+                    "building classification. Try selecting the centre of a field."
+                ),
+                "latitude": latitude,
+                "longitude": longitude,
+                "vegetation_fraction": round(vegetation_fraction, 4),
+                "mean_ndvi_screen": round(mean_for_screen, 4),
+                "valid_pixels": int(successful_ndvi.size),
+                "date_from": selected_from_date,
+                "date_to": selected_to_date,
+                "cloud_coverage_limit": selected_cloud_limit,
+                "search_attempts": attempts,
+            }), 200
+
+        # ====================================================
         # NDVI STATISTICS
         # ====================================================
 
