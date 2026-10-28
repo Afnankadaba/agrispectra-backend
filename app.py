@@ -1613,6 +1613,63 @@ def explain_ndvi():
 
 
 # ============================================================
+# OPENSTREETMAP BUILT-UP AREA SCREENING
+# ============================================================
+def detect_built_up_area(bbox):
+    """Estimate mapped building coverage inside [west, south, east, north].
+
+    This is a best-effort screen only: OSM building data may be incomplete,
+    and footprint area is an approximation. If Overpass is unavailable, the
+    caller should continue with Sentinel-2 analysis.
+    """
+    west, south, east, north = bbox
+    query = f"""
+    [out:json][timeout:20];
+    way[\"building\"]({south},{west},{north},{east});
+    out geom;
+    """
+    response = requests.post(
+        "https://overpass-api.de/api/interpreter",
+        data={"data": query},
+        timeout=25,
+    )
+    response.raise_for_status()
+    elements = response.json().get("elements", [])
+
+    mid_lat = (south + north) / 2.0
+    width_m = (east - west) * 111320.0 * np.cos(np.radians(mid_lat))
+    height_m = (north - south) * 110540.0
+    bbox_area = width_m * height_m
+    if bbox_area <= 0:
+        return False, 0.0, 0
+
+    building_area = 0.0
+    building_count = 0
+    for element in elements:
+        points = element.get("geometry", [])
+        if len(points) < 4:
+            continue
+        polygon = [
+            (point["lon"] * 111320.0 * np.cos(np.radians(mid_lat)),
+             point["lat"] * 110540.0)
+            for point in points
+        ]
+        area = 0.5 * abs(sum(
+            polygon[i][0] * polygon[(i + 1) % len(polygon)][1]
+            - polygon[(i + 1) % len(polygon)][0] * polygon[i][1]
+            for i in range(len(polygon))
+        ))
+        if area > 0:
+            building_area += area
+            building_count += 1
+
+    coverage = min(building_area / bbox_area, 1.0)
+    # Conservative thresholds: avoid rejecting areas based on a few mapped roofs.
+    is_built_up = coverage >= 0.12 and building_count >= 10
+    return is_built_up, coverage, building_count
+
+
+# ============================================================
 # SENTINEL-2 NDVI
 # ============================================================
 
@@ -1750,6 +1807,32 @@ def sentinel_ndvi():
             latitude + delta,
 
         ]
+
+
+        # Best-effort building footprint check using OpenStreetMap.
+        # If the external service fails, continue with Sentinel-2 and NDVI screening.
+        try:
+            built_up, building_coverage, building_count = detect_built_up_area(bbox)
+            app.logger.info(
+                "OSM building coverage %.2f%% (%s mapped buildings)",
+                building_coverage * 100, building_count
+            )
+            if built_up:
+                return jsonify({
+                    "success": False,
+                    "area_type": "built_up",
+                    "message": (
+                        "This selected area appears to contain substantial mapped "
+                        "building coverage. Crop-health analysis is unavailable "
+                        "for this selection. Please select the centre of a farmland area."
+                    ),
+                    "latitude": latitude,
+                    "longitude": longitude,
+                    "building_coverage": round(building_coverage, 4),
+                    "building_count": building_count,
+                }), 200
+        except Exception as exc:
+            app.logger.warning("OpenStreetMap building screening unavailable: %s", exc)
 
 
         print(
