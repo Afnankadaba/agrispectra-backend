@@ -1665,7 +1665,7 @@ def detect_built_up_area(bbox):
 
     coverage = min(building_area / bbox_area, 1.0)
     # Conservative thresholds: avoid rejecting areas based on a few mapped roofs.
-    is_built_up = coverage >= 0.12 and building_count >= 10
+    is_built_up = coverage >= 0.03 and building_count >= 5
     return is_built_up, coverage, building_count
 
 
