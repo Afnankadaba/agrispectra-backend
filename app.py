@@ -3,12 +3,11 @@ from flask_cors import CORS
 from dotenv import load_dotenv
 
 import os
-import base64
-import struct
-import zlib
 import requests
 import numpy as np
 import tifffile
+from PIL import Image
+import base64
 
 from io import BytesIO
 from datetime import datetime, timedelta, timezone
@@ -901,6 +900,59 @@ def generate_xai_explanation(
 # HOME
 # ============================================================
 
+def detect_built_up_area(bbox):
+    """Best-effort OSM screening for areas with many mapped buildings.
+
+    bbox uses [west, south, east, north]. OSM building coverage is not
+    complete everywhere, so this is a screening hint, not ground truth.
+    Raises RuntimeError if all Overpass servers fail.
+    """
+    west, south, east, north = bbox
+    query = f"""[out:json][timeout:20];(way[\"building\"]({south},{west},{north},{east});relation[\"building\"]({south},{west},{north},{east}););out ids;"""
+    servers = [
+        "https://overpass-api.de/api/interpreter",
+        "https://overpass.kumi.systems/api/interpreter",
+        "https://overpass.nchc.org.tw/api/interpreter",
+    ]
+    errors = []
+    for server in servers:
+        try:
+            response = requests.post(
+                server,
+                data={"data": query},
+                headers={"User-Agent": "AgriSpectra/1.0"},
+                timeout=25,
+            )
+            response.raise_for_status()
+            elements = response.json().get("elements", [])
+            # Count mapped building features. This does not estimate actual
+            # footprint coverage; threshold is a conservative heuristic.
+            building_count = len(elements)
+            return building_count >= 25, None, building_count
+        except (requests.RequestException, ValueError) as exc:
+            errors.append(f"{server}: {exc}")
+    raise RuntimeError("OpenStreetMap building screening unavailable: " + " | ".join(errors))
+
+
+def _get_coordinates_and_language():
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        if "latitude" not in data or "longitude" not in data:
+            raise ValueError("Latitude and longitude are required.")
+        latitude = float(data["latitude"])
+        longitude = float(data["longitude"])
+        language = data.get("language", "en")
+    else:
+        latitude = float(request.args.get("latitude", "11.2588"))
+        longitude = float(request.args.get("longitude", "75.7804"))
+        language = request.args.get("language", "en")
+    if not -90 <= latitude <= 90:
+        raise ValueError("Invalid latitude")
+    if not -180 <= longitude <= 180:
+        raise ValueError("Invalid longitude")
+    return latitude, longitude, language
+
+
 @app.route("/")
 def home():
 
@@ -1270,149 +1322,6 @@ def decode_ndvi_tiff(content):
     return valid_ndvi
 
 
-
-# ============================================================
-# NDVI HEATMAP API
-# Returns a transparent PNG encoded as base64 plus geographic bounds.
-# ============================================================
-
-def decode_ndvi_grid(content):
-    image = np.asarray(tifffile.imread(BytesIO(content)), dtype=np.float32)
-
-    if image.ndim == 3 and image.shape[0] == 2:
-        ndvi_array, mask_array = image[0], image[1]
-    elif image.ndim == 3 and image.shape[-1] == 2:
-        ndvi_array, mask_array = image[:, :, 0], image[:, :, 1]
-    else:
-        raise ValueError(f"Unexpected TIFF structure: {image.shape}")
-
-    valid = (
-        (mask_array > 0)
-        & (ndvi_array >= -1.0)
-        & (ndvi_array <= 1.0)
-        & np.isfinite(ndvi_array)
-    )
-    return ndvi_array, valid
-
-
-def _png_chunk(chunk_type, data):
-    chunk = chunk_type + data
-    return (
-        struct.pack(">I", len(data))
-        + chunk
-        + struct.pack(">I", zlib.crc32(chunk) & 0xffffffff)
-    )
-
-
-def ndvi_grid_to_png(ndvi_array, valid_mask):
-    """Create a transparent RGBA PNG: red low, yellow moderate, green high."""
-    height, width = ndvi_array.shape
-    raw = bytearray()
-
-    # PNG rows run from north to south. The TIFF grid is kept in its source order.
-    for y in range(height):
-        raw.append(0)  # PNG filter: None
-        for x in range(width):
-            if not valid_mask[y, x]:
-                raw.extend((0, 0, 0, 0))
-                continue
-
-            value = float(ndvi_array[y, x])
-            if value < 0.20:
-                rgba = (220, 55, 55, 205)       # low vegetation
-            elif value < 0.50:
-                rgba = (255, 205, 45, 205)      # moderate vegetation
-            else:
-                rgba = (35, 160, 75, 205)       # higher vegetation
-            raw.extend(rgba)
-
-    png = (
-        b"\x89PNG\r\n\x1a\n"
-        + _png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
-        + _png_chunk(b"IDAT", zlib.compress(bytes(raw)))
-        + _png_chunk(b"IEND", b"")
-    )
-    return png
-
-
-@app.route("/sentinel-ndvi-heatmap", methods=["GET"])
-def sentinel_ndvi_heatmap():
-    try:
-        latitude = float(request.args.get("latitude", ""))
-        longitude = float(request.args.get("longitude", ""))
-
-        if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
-            return jsonify({"success": False, "error": "Invalid coordinates."}), 400
-
-        # Match the current /sentinel-ndvi bounding box (about 1 km across).
-        delta = 0.005
-        bbox = [longitude - delta, latitude - delta, longitude + delta, latitude + delta]
-        token = get_copernicus_token()
-        today = datetime.now(timezone.utc)
-        attempts = []
-
-        for strategy in [
-            {"days": 60, "cloud": 30},
-            {"days": 120, "cloud": 60},
-            {"days": 180, "cloud": 80},
-            {"days": 365, "cloud": 90},
-        ]:
-            from_date = (today - timedelta(days=strategy["days"])).strftime("%Y-%m-%dT00:00:00Z")
-            to_date = today.strftime("%Y-%m-%dT23:59:59Z")
-            try:
-                content = request_sentinel_image(
-                    token, bbox, from_date, to_date, strategy["cloud"]
-                )
-                ndvi_grid, valid_mask = decode_ndvi_grid(content)
-                valid_count = int(np.count_nonzero(valid_mask))
-                attempts.append({
-                    "days": strategy["days"],
-                    "cloud_limit": strategy["cloud"],
-                    "valid_pixels": valid_count,
-                })
-                if valid_count:
-                    png = ndvi_grid_to_png(ndvi_grid, valid_mask)
-                    return jsonify({
-                        "success": True,
-                        "image_base64": base64.b64encode(png).decode("ascii"),
-                        "bounds": {
-                            "south": latitude - delta,
-                            "west": longitude - delta,
-                            "north": latitude + delta,
-                            "east": longitude + delta,
-                        },
-                        "valid_pixels": valid_count,
-                        "date_from": from_date,
-                        "date_to": to_date,
-                        "cloud_coverage_limit": strategy["cloud"],
-                        "legend": {
-                            "red": "NDVI below 0.20 — low vegetation",
-                            "yellow": "NDVI 0.20–0.49 — moderate vegetation",
-                            "green": "NDVI 0.50 or higher — higher vegetation",
-                        },
-                        "attempts": attempts,
-                    })
-
-            except Exception as exc:
-                attempts.append({
-                    "days": strategy["days"],
-                    "cloud_limit": strategy["cloud"],
-                    "error": str(exc)[:500],
-                })
-
-        return jsonify({
-            "success": False,
-            "error": "No valid Sentinel-2 pixels were found for the heatmap.",
-            "attempts": attempts,
-        }), 404
-
-    except ValueError:
-        return jsonify({"success": False, "error": "Valid latitude and longitude are required."}), 400
-    except Exception as exc:
-        app.logger.exception("NDVI heatmap generation failed")
-        return jsonify({"success": False, "error": str(exc)[:500]}), 500
-
-
 # ============================================================
 # EXPLAIN NDVI API
 #
@@ -1613,63 +1522,6 @@ def explain_ndvi():
 
 
 # ============================================================
-# OPENSTREETMAP BUILT-UP AREA SCREENING
-# ============================================================
-def detect_built_up_area(bbox):
-    """Estimate mapped building coverage inside [west, south, east, north].
-
-    This is a best-effort screen only: OSM building data may be incomplete,
-    and footprint area is an approximation. If Overpass is unavailable, the
-    caller should continue with Sentinel-2 analysis.
-    """
-    west, south, east, north = bbox
-    query = f"""
-    [out:json][timeout:20];
-    way[\"building\"]({south},{west},{north},{east});
-    out geom;
-    """
-    response = requests.post(
-        "https://overpass-api.de/api/interpreter",
-        data={"data": query},
-        timeout=25,
-    )
-    response.raise_for_status()
-    elements = response.json().get("elements", [])
-
-    mid_lat = (south + north) / 2.0
-    width_m = (east - west) * 111320.0 * np.cos(np.radians(mid_lat))
-    height_m = (north - south) * 110540.0
-    bbox_area = width_m * height_m
-    if bbox_area <= 0:
-        return False, 0.0, 0
-
-    building_area = 0.0
-    building_count = 0
-    for element in elements:
-        points = element.get("geometry", [])
-        if len(points) < 4:
-            continue
-        polygon = [
-            (point["lon"] * 111320.0 * np.cos(np.radians(mid_lat)),
-             point["lat"] * 110540.0)
-            for point in points
-        ]
-        area = 0.5 * abs(sum(
-            polygon[i][0] * polygon[(i + 1) % len(polygon)][1]
-            - polygon[(i + 1) % len(polygon)][0] * polygon[i][1]
-            for i in range(len(polygon))
-        ))
-        if area > 0:
-            building_area += area
-            building_count += 1
-
-    coverage = min(building_area / bbox_area, 1.0)
-    # Conservative thresholds: avoid rejecting areas based on a few mapped roofs.
-    is_built_up = coverage >= 0.03 and building_count >= 5
-    return is_built_up, coverage, building_count
-
-
-# ============================================================
 # SENTINEL-2 NDVI
 # ============================================================
 
@@ -1808,31 +1660,39 @@ def sentinel_ndvi():
 
         ]
 
-
-        # Best-effort building footprint check using OpenStreetMap.
-        # If the external service fails, continue with Sentinel-2 and NDVI screening.
+        # Optional OpenStreetMap building screening.
+        # If public Overpass servers are unavailable, continue with Sentinel-2
+        # analysis but clearly report that screening could not be completed.
+        screening_available = True
+        screening_message = None
+        building_count = None
         try:
-            built_up, building_coverage, building_count = detect_built_up_area(bbox)
-            app.logger.info(
-                "OSM building coverage %.2f%% (%s mapped buildings)",
-                building_coverage * 100, building_count
+            built_up, _, building_count = detect_built_up_area(bbox)
+        except RuntimeError as screening_error:
+            app.logger.warning(
+                "OpenStreetMap screening unavailable; continuing with NDVI: %s",
+                screening_error,
             )
-            if built_up:
-                return jsonify({
-                    "success": False,
-                    "area_type": "built_up",
-                    "message": (
-                        "This selected area appears to contain substantial mapped "
-                        "building coverage. Crop-health analysis is unavailable "
-                        "for this selection. Please select the centre of a farmland area."
-                    ),
-                    "latitude": latitude,
-                    "longitude": longitude,
-                    "building_coverage": round(building_coverage, 4),
-                    "building_count": building_count,
-                }), 200
-        except Exception as exc:
-            app.logger.warning("OpenStreetMap building screening unavailable: %s", exc)
+            built_up = False
+            screening_available = False
+            screening_message = (
+                "OpenStreetMap building screening was unavailable. "
+                "NDVI analysis continued without this check; verify that the "
+                "selected location is farmland."
+            )
+
+        if built_up:
+            return jsonify({
+                "success": False,
+                "error": "built_up_area_detected",
+                "message": (
+                    "This location has many OpenStreetMap building records. "
+                    "Please select a farm or vegetated area. OSM coverage may be incomplete."
+                ),
+                "latitude": latitude,
+                "longitude": longitude,
+                "building_count": building_count,
+            }), 422
 
 
         print(
@@ -2098,42 +1958,6 @@ def sentinel_ndvi():
 
 
         # ====================================================
-        # VEGETATION SUITABILITY SCREEN (NOT A BUILDING CLASSIFIER)
-        # ====================================================
-        # NDVI alone cannot reliably distinguish buildings from bare soil,
-        # dry fields, or other non-vegetated surfaces. This conservative
-        # screen prevents a crop-health score when almost no pixels show
-        # meaningful vegetation, but labels the result as a *possible*
-        # built-up/non-vegetated area rather than claiming certainty.
-        vegetation_fraction = float(
-            np.count_nonzero(successful_ndvi >= 0.25)
-            / successful_ndvi.size
-        ) if successful_ndvi.size else 0.0
-        mean_for_screen = float(np.mean(successful_ndvi))
-
-        if mean_for_screen < 0.15 and vegetation_fraction < 0.08:
-            return jsonify({
-                "success": False,
-                "area_type": "possible_built_up_or_non_vegetated",
-                "message": (
-                    "Sorry, this selected area appears to have very little "
-                    "vegetation and may be a built-up or non-vegetated area. "
-                    "Crop-health analysis is unavailable for this selection. "
-                    "This is an NDVI-based screening result, not a definitive "
-                    "building classification. Try selecting the centre of a field."
-                ),
-                "latitude": latitude,
-                "longitude": longitude,
-                "vegetation_fraction": round(vegetation_fraction, 4),
-                "mean_ndvi_screen": round(mean_for_screen, 4),
-                "valid_pixels": int(successful_ndvi.size),
-                "date_from": selected_from_date,
-                "date_to": selected_to_date,
-                "cloud_coverage_limit": selected_cloud_limit,
-                "search_attempts": attempts,
-            }), 200
-
-        # ====================================================
         # NDVI STATISTICS
         # ====================================================
 
@@ -2212,22 +2036,18 @@ def sentinel_ndvi():
             )
         )
 
-
-        # ====================================================
-        # HEALTH PERCENTAGE
-        # ====================================================
-
-        health_percentage = (
-            ((mean_ndvi + 1) / 2) * 100
-        )
-
-        health_percentage = max(
-            0,
-            min(
-                100,
-                health_percentage
+        # Keep the recommendation cautious: NDVI alone cannot diagnose a crop.
+        if mean_ndvi < 0.4:
+            extra_action = (
+                "Compare with the same field's earlier satellite dates, "
+                "confirm crop type and growth stage, and inspect soil moisture "
+                "and visible symptoms before deciding on treatment."
             )
-        )
+            current_action = xai_explanation.get("action", "")
+            if extra_action not in current_action:
+                xai_explanation["action"] = (
+                    f"{current_action} {extra_action}".strip()
+                )
 
 
         # ====================================================
@@ -2251,6 +2071,15 @@ def sentinel_ndvi():
 
             "longitude":
                 longitude,
+
+            "building_count":
+                building_count,
+
+            "building_screening_available":
+                screening_available,
+
+            "building_screening_message":
+                screening_message,
 
             "bbox":
                 bbox,
@@ -2299,10 +2128,14 @@ def sentinel_ndvi():
                     successful_ndvi.size
                 ),
 
-            "health_percentage":
-                round(
-                    health_percentage
-                ),
+            "health_score_note":
+                "A validated crop-health percentage is not calculated. "
+                "NDVI measures vegetation greenness and must be interpreted "
+                "with crop type, growth stage, season, and local conditions.",
+
+            "ndvi_interpretation":
+                "NDVI is a vegetation greenness indicator, not a direct "
+                "measurement of crop health or yield.",
 
             "health_status":
                 health_status,
@@ -2426,6 +2259,97 @@ def sentinel_ndvi():
 
 
 # ============================================================
+# SENTINEL-2 NDVI HEATMAP
+# Returns a transparent PNG as base64 plus geographic bounds.
+# ============================================================
+
+@app.route("/sentinel-ndvi-heatmap", methods=["GET", "POST"])
+def sentinel_ndvi_heatmap():
+    try:
+        latitude, longitude, language = _get_coordinates_and_language()
+        delta = 0.005
+        bbox = [longitude - delta, latitude - delta,
+                longitude + delta, latitude + delta]
+        token = get_copernicus_token()
+        today = datetime.now(timezone.utc)
+        strategies = [(60, 30), (120, 60), (180, 80), (365, 90)]
+        ndvi_array = None
+        mask_array = None
+        selected_from = None
+        selected_to = None
+        selected_cloud = None
+        attempts = []
+        for days, cloud in strategies:
+            from_date = (today - timedelta(days=days)).strftime("%Y-%m-%dT00:00:00Z")
+            to_date = today.strftime("%Y-%m-%dT23:59:59Z")
+            try:
+                content = request_sentinel_image(token, bbox, from_date, to_date, cloud)
+                image_data = np.asarray(tifffile.imread(BytesIO(content)), dtype=np.float32)
+                if image_data.ndim == 3 and image_data.shape[0] == 2:
+                    values, mask = image_data[0], image_data[1]
+                elif image_data.ndim == 3 and image_data.shape[-1] == 2:
+                    values, mask = image_data[:, :, 0], image_data[:, :, 1]
+                else:
+                    raise ValueError(f"Unexpected TIFF structure: {image_data.shape}")
+                valid = ((mask > 0) & np.isfinite(values) & (values >= -1) & (values <= 1))
+                if np.any(valid):
+                    ndvi_array = values.copy()
+                    mask_array = valid
+                    selected_from, selected_to, selected_cloud = from_date, to_date, cloud
+                    attempts.append({"days": days, "cloud_limit": cloud, "valid_pixels": int(valid.sum())})
+                    break
+                attempts.append({"days": days, "cloud_limit": cloud, "valid_pixels": 0})
+            except Exception as exc:
+                attempts.append({"days": days, "cloud_limit": cloud, "error": str(exc)})
+        if ndvi_array is None:
+            return jsonify({"success": False, "message": "No valid Sentinel-2 pixels available.", "attempts": attempts}), 404
+
+        # Map NDVI from -1..1 to a red-yellow-green transparent heatmap.
+        h, w = ndvi_array.shape
+        rgba = np.zeros((h, w, 4), dtype=np.uint8)
+        clipped = np.clip(ndvi_array, -1.0, 1.0)
+        # Simple color ramp: red -> yellow -> green.
+        for y in range(h):
+            for x in range(w):
+                if not mask_array[y, x]:
+                    continue
+                value = float(clipped[y, x])
+                if value < 0.0:
+                    t = value + 1.0
+                    red, green, blue = 180, int(40 + 100 * t), 40
+                elif value < 0.5:
+                    t = value / 0.5
+                    red, green, blue = 230, int(130 + 100 * t), 20
+                else:
+                    t = min(1.0, (value - 0.5) / 0.5)
+                    red, green, blue = int(230 * (1 - t)), int(230), int(20 + 40 * t)
+                rgba[y, x] = [red, green, blue, 210]
+        output = BytesIO()
+        Image.fromarray(rgba, mode="RGBA").resize((300, 300), Image.Resampling.NEAREST).save(output, format="PNG")
+        encoded = base64.b64encode(output.getvalue()).decode("ascii")
+        return jsonify({
+            "success": True,
+            "image_base64": encoded,
+            "image_data_url": "data:image/png;base64," + encoded,
+            "bounds": {"west": bbox[0], "south": bbox[1], "east": bbox[2], "north": bbox[3]},
+            "latitude": latitude,
+            "longitude": longitude,
+            "date_from": selected_from,
+            "date_to": selected_to,
+            "cloud_coverage_limit": selected_cloud,
+            "valid_pixels": int(mask_array.sum()),
+            "note": "NDVI visualization; colors are a display ramp, not a measured health percentage."
+        })
+    except ValueError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+    except requests.exceptions.Timeout:
+        return jsonify({"success": False, "error": "Sentinel-2 request timed out."}), 504
+    except Exception as exc:
+        app.logger.exception("NDVI heatmap failed")
+        return jsonify({"success": False, "error": str(exc)}), 500
+
+
+# ============================================================
 # RUN SERVER
 # ============================================================
 
@@ -2437,6 +2361,6 @@ if __name__ == "__main__":
 
         port=5000,
 
-        debug=True
+        debug=os.getenv("FLASK_DEBUG", "false").lower() == "true"
 
     )
