@@ -8,6 +8,9 @@ import numpy as np
 import tifffile
 from PIL import Image
 import base64
+import json
+from pathlib import Path
+from werkzeug.utils import secure_filename
 
 from io import BytesIO
 from datetime import datetime, timedelta, timezone
@@ -26,6 +29,61 @@ load_dotenv()
 
 app = Flask(__name__)
 CORS(app)
+
+
+# ============================================================
+# ARECANUT DISEASE MODEL (loaded only when first prediction is requested)
+# ============================================================
+
+BASE_DIR = Path(__file__).resolve().parent
+DISEASE_MODEL_DIR = BASE_DIR / "disease_model"
+DISEASE_MODEL_PATH = DISEASE_MODEL_DIR / "arecanut_model.keras"
+DISEASE_CLASSES_PATH = DISEASE_MODEL_DIR / "class_names.json"
+
+_disease_model = None
+_disease_class_names = None
+
+ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp"}
+MAX_DISEASE_IMAGE_BYTES = 10 * 1024 * 1024  # 10 MB
+
+
+def load_arecanut_model():
+    """Load the trained classifier once, when the endpoint is first used."""
+    global _disease_model, _disease_class_names
+
+    if _disease_model is not None and _disease_class_names is not None:
+        return _disease_model, _disease_class_names
+
+    if not DISEASE_MODEL_PATH.is_file():
+        raise FileNotFoundError(
+            f"Model file not found: {DISEASE_MODEL_PATH}"
+        )
+    if not DISEASE_CLASSES_PATH.is_file():
+        raise FileNotFoundError(
+            f"Class names file not found: {DISEASE_CLASSES_PATH}"
+        )
+
+    # The trained model contains a Lambda layer using MobileNetV2 preprocessing.
+    from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
+    import tensorflow as tf
+
+    model = tf.keras.models.load_model(
+        DISEASE_MODEL_PATH,
+        custom_objects={"preprocess_input": preprocess_input},
+        compile=False
+    )
+
+    with open(DISEASE_CLASSES_PATH, "r", encoding="utf-8") as class_file:
+        class_names = json.load(class_file)
+
+    if not isinstance(class_names, list) or not class_names:
+        raise ValueError("class_names.json must contain a non-empty list.")
+
+    _disease_model = model
+    _disease_class_names = class_names
+    return _disease_model, _disease_class_names
+
+
 
 
 # ============================================================
@@ -2347,6 +2405,101 @@ def sentinel_ndvi_heatmap():
     except Exception as exc:
         app.logger.exception("NDVI heatmap failed")
         return jsonify({"success": False, "error": str(exc)}), 500
+
+
+
+
+# ============================================================
+# ARECANUT DISEASE PREDICTION API
+# POST /predict-arecanut
+# Multipart form field: image
+# ============================================================
+
+@app.route("/predict-arecanut", methods=["POST"])
+def predict_arecanut():
+    if "image" not in request.files:
+        return jsonify({
+            "success": False,
+            "error": "Image file is required. Send it using the 'image' field."
+        }), 400
+
+    uploaded_file = request.files["image"]
+    if not uploaded_file or not uploaded_file.filename:
+        return jsonify({"success": False, "error": "Please select an image."}), 400
+
+    safe_name = secure_filename(uploaded_file.filename)
+    extension = Path(safe_name).suffix.lower()
+    if extension not in ALLOWED_IMAGE_EXTENSIONS:
+        return jsonify({
+            "success": False,
+            "error": "Unsupported image type. Use JPG, JPEG, PNG, or BMP."
+        }), 400
+
+    image_bytes = uploaded_file.read(MAX_DISEASE_IMAGE_BYTES + 1)
+    if not image_bytes:
+        return jsonify({"success": False, "error": "The uploaded image is empty."}), 400
+    if len(image_bytes) > MAX_DISEASE_IMAGE_BYTES:
+        return jsonify({"success": False, "error": "Image must be 10 MB or smaller."}), 413
+
+    try:
+        # Decode and normalize the image in memory; no upload is saved to disk.
+        with Image.open(BytesIO(image_bytes)) as source_image:
+            source_image.verify()
+
+        with Image.open(BytesIO(image_bytes)) as source_image:
+            rgb_image = source_image.convert("RGB").resize(
+                (224, 224), Image.Resampling.BILINEAR
+            )
+            image_array = np.asarray(rgb_image, dtype=np.float32)
+            image_array = np.expand_dims(image_array, axis=0)
+
+        model, class_names = load_arecanut_model()
+        prediction_scores = np.asarray(
+            model.predict(image_array, verbose=0)[0],
+            dtype=np.float32
+        )
+
+        if prediction_scores.size != len(class_names):
+            raise ValueError(
+                "Model output count does not match class_names.json."
+            )
+
+        predicted_index = int(np.argmax(prediction_scores))
+        predicted_category = class_names[predicted_index]
+        model_score = float(prediction_scores[predicted_index]) * 100.0
+
+        all_scores = {
+            name: round(float(score) * 100.0, 2)
+            for name, score in zip(class_names, prediction_scores)
+        }
+
+        return jsonify({
+            "success": True,
+            "filename": safe_name,
+            "predicted_category": predicted_category,
+            "model_score_percent": round(model_score, 2),
+            "category_scores_percent": all_scores,
+            "model": "MobileNetV2",
+            "image_size": "224x224",
+            "note": (
+                "Experimental image-classification result, not a confirmed "
+                "agricultural diagnosis. Check the plant in person and consult "
+                "a qualified agricultural expert before treatment."
+            )
+        })
+
+    except (OSError, ValueError) as exc:
+        return jsonify({
+            "success": False,
+            "error": "Could not process this image.",
+            "details": str(exc)
+        }), 400
+    except Exception:
+        app.logger.exception("Arecanut disease prediction failed")
+        return jsonify({
+            "success": False,
+            "error": "Arecanut prediction failed. Check the backend logs."
+        }), 500
 
 
 # ============================================================
